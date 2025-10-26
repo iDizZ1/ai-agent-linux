@@ -1,18 +1,18 @@
-# config.py - Конфигурация с логированием 
+# config.py - Конфигурация с логированием (ИСПРАВЛЕНО для вывода в консоль)
 
 import logging
 import os
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    model_name: str = "IlyaGusev/saiga_nemo_12b"  
-    temperature: float = 0.3  
-    top_k: int = 40  
-    top_p: float = 0.9 
-    timeout: int = 30  
-    log_level: str = "INFO" 
-    log_file: str = "aiask.log" 
-    console_logging: bool = False  
+    model_name: str = "qwen3:1.7b"
+    temperature: float = 0.3
+    top_k: int = 40
+    top_p: float = 0.9
+    timeout: int = 30
+    log_level: str = "INFO"
+    log_file: str = "aiask.log"
+    console_logging: bool = True  # ИЗМЕНЕНО: теперь True по умолчанию
 
 settings = Settings()
 
@@ -24,11 +24,15 @@ def setup_logging():
     os.makedirs("logs", exist_ok=True)
     
     # Настраиваем обработчики
-    handlers = [logging.FileHandler(f"logs/{settings.log_file}")]
+    handlers = [
+        logging.FileHandler(f"logs/{settings.log_file}")
+    ]
     
-    # Добавляем консольный вывод только если включен в настройках
+    # Консольный вывод ВСЕГДА включён
     if settings.console_logging:
-        handlers.append(logging.StreamHandler())
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.WARNING)  # В консоль только WARNING и выше
+        handlers.append(console_handler)
     
     logging.basicConfig(
         level=getattr(logging, settings.log_level),

@@ -1,146 +1,175 @@
-# llm_client.py — клиент для генерации команд через LLM
+# llm_client.py - Клиент для генерации команд 
 
 import requests
 import re
+import shlex
 import logging
 from config import settings
 
 logger = logging.getLogger(__name__)
-
 API_URL = "http://localhost:11434/v1/chat/completions"
+
+# Регулярные шаблоны для парсинга
+COMMAND_PATTERNS = [
+    # Стандартный формат: "Команда: <команда>"
+    r'(?:Команда:|Command:)\s*`?(.+?)`?(?:\n|$)',
+    
+    # Markdown блоки с bash/sh
+    r'```(?:bash|sh)\s*\n(.+?)\n```',
+    
+    # Просто команда в backticks
+    r'`([^`]+)`',
+    
+    # Первая непустая строка (fallback)
+    r'^(.+)$'
+]
+
+# Whitelist утилит
+COMMON_COMMANDS = {
+    'ls','cd','pwd','mkdir','rmdir','rm','cp','mv','find','grep','cat',
+    'less','more','head','tail','wc','sort','uniq','cut','awk','sed',
+    'chmod','chown','ps','top','kill','jobs','df','du','free','tar',
+    'gzip','gunzip','zip','unzip','wget','curl','ssh','scp','docker','git',
+    'python','node','npm','pip','sudo','touch','echo','man'
+}
 
 def generate_command(prompt: str) -> dict:
     """
-    Отправляет запрос к локальному серверу Ollama с моделью Saiga Mistral Nemo 12B.
-    Возвращает словарь {"command": <команда>, "explanation": <текст>}.
+    Отправляет запрос к локальному серверу Ollama.
     """
-    logger.info(f"Получен запрос: {prompt}")
+    system_prompt = (
+        "Ты — AI ассистент для Linux. Отвечай строго в формате:\n"
+        "Команда: <bash_команда>\n"
+        "Объяснение: <русское объяснение>\n\n"
+        "Не используй markdown блоки, только простой текст."
+    )
     
-    system_prompt = """Ты — AI ассистент для Linux систем. Пользователь описывает задачу на естественном языке, а ты должен предложить соответствующую bash команду.
-
-Отвечай СТРОГО в формате:
-Команда: <bash_команда>
-Объяснение: <краткое объяснение на русском>
-
-Примеры:
-Пользователь: "Создать папку test"
-Ты: "Команда: mkdir test
-Объяснение: Создание директории с именем test"
-
-Пользователь: "Показать скрытые файлы"
-Ты: "Команда: ls -la  
-Объяснение: Показ всех файлов включая скрытые с подробной информацией"
-
-Отвечай только командой и объяснением, без дополнительного текста."""
-
     payload = {
-        "model": settings.model_name,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
+        'model': settings.model_name,
+        'messages': [
+            {'role':'system','content':system_prompt},
+            {'role':'user','content':prompt}
         ],
-        "temperature": settings.temperature,
-        "top_k": settings.top_k,
-        "top_p": settings.top_p,
-        "stream": False
+        'temperature':settings.temperature,
+        'top_k':settings.top_k,
+        'top_p':settings.top_p,
+        'stream':False
     }
-
+    
     try:
-        logger.debug(f"Отправка запроса к LLM: {payload}")
-        response = requests.post(
-            API_URL, 
-            json=payload, 
-            timeout=settings.timeout + 5
-        )
-        response.raise_for_status()
-        
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        logger.info(f"Получен ответ от LLM: {content}")
-        
-        parsed = parse_response(content)
-        logger.info(f"Разобранная команда: {parsed['command']}")
-        
-        return parsed
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Ошибка подключения к LLM: {e}")
-        return {"command": "", "explanation": f"Ошибка подключения к LLM: {e}"}
+        resp = requests.post(API_URL, json=payload, timeout=settings.timeout)
+        resp.raise_for_status()
+        content = resp.json()['choices'][0]['message']['content']
+        logger.info(f"LLM ответ: {content}")
+        return parse_response(content)
+    except requests.RequestException as e:
+        logger.error(f"Ошибка запроса к LLM: {e}")
+        return {'command':'','explanation':f'Ошибка подключения: {e}'}
     except Exception as e:
-        logger.error(f"Неожиданная ошибка: {e}")
-        return {"command": "", "explanation": f"Произошла ошибка: {e}"}
+        logger.error(f"Ошибка генерации: {e}")
+        return {'command':'','explanation':f'Ошибка: {e}'}
 
 def parse_response(content: str) -> dict:
-    """Парсит ответ модели и извлекает команду и объяснение."""
-    logger.debug(f"Парсинг ответа: {content}")
+    """
+    Парсит ответ LLM с улучшенной обработкой.
+    """
+    # Удаляем ANSI-escape коды
+    clean = re.sub(r'\x1B\[[0-?]*[ -/]*[@-~]', '', content).strip()
     
-    # Основной парсинг по ключевым словам
-    command_match = re.search(r'(?:Команда:|Command:)\s*(.+?)(?:\n|$)', content, re.IGNORECASE)
-    explanation_match = re.search(r'(?:Объяснение:|Explanation:)\s*(.+?)(?:\n|$)', content, re.IGNORECASE)
+    cmd = ''
+    expl = ''
     
-    if command_match:
-        command = command_match.group(1).strip()
-        explanation = explanation_match.group(1).strip() if explanation_match else ""
-        
-        # Убираем backticks если есть
-        command = command.strip('`')
-        
-        # Проверяем валидность команды
-        if is_valid_command(command):
-            logger.debug(f"Успешно извлечена команда: {command}")
-            return {"command": command, "explanation": explanation}
+    logger.debug(f"Парсинг контента: {clean[:100]}...")
     
-    # Fallback: попытка извлечь код в backticks
-    code_match = re.search(r'```(?:bash|sh)?\n(.+?)\n```', content, re.DOTALL | re.IGNORECASE)
-    if code_match:
-        command = code_match.group(1).strip()
-        if is_valid_command(command):
-            logger.debug(f"Команда извлечена из блока кода: {command}")
-            return {"command": command, "explanation": ""}
+    # 1. Извлекаем объяснение
+    expl_match = re.search(r'(?:Объяснение:|Explanation:)\s*(.+?)(?:\n\n|\n(?:Команда:|Command:)|$)', 
+                          clean, re.IGNORECASE | re.DOTALL)
+    if expl_match:
+        expl = expl_match.group(1).strip()[:200]  # Ограничиваем длину
+        logger.debug(f"Найдено объяснение: {expl[:50]}...")
     
-    # Fallback: первая строка, которая выглядит как команда
-    lines = content.split('\n')
-    for line in lines:
-        line = line.strip()
-        if line and not line.startswith(('Команда:', 'Объяснение:', '#', '//')):
+    # 2. Пробуем извлечь команду разными способами
+    
+    # Способ 1: Стандартный формат "Команда: <cmd>"
+    cmd_match = re.search(r'(?:Команда:|Command:)\s*(.+?)(?:\n|$)', clean, re.IGNORECASE)
+    if cmd_match:
+        candidate = cmd_match.group(1).strip()
+        # Убираем backticks и пробелы
+        candidate = candidate.strip('`').strip()
+        if is_valid_command(candidate):
+            cmd = candidate
+            logger.debug(f"Извлечена команда (способ 1): {cmd}")
+    
+    # Способ 2: Markdown блок ```bash\n<cmd>\n```
+    if not cmd:
+        bash_match = re.search(r'```(?:bash|sh)\s*\n(.+?)\n```', clean, re.DOTALL | re.IGNORECASE)
+        if bash_match:
+            candidate = bash_match.group(1).strip()
+            # Берём только первую строку если многострочный блок
+            candidate = candidate.split('\n')[0].strip()
+            if is_valid_command(candidate):
+                cmd = candidate
+                logger.debug(f"Извлечена команда (способ 2): {cmd}")
+    
+    # Способ 3: Просто в backticks `<cmd>`
+    if not cmd:
+        tick_match = re.search(r'`([^`]+)`', clean)
+        if tick_match:
+            candidate = tick_match.group(1).strip()
+            if is_valid_command(candidate):
+                cmd = candidate
+                logger.debug(f"Извлечена команда (способ 3): {cmd}")
+    
+    # Способ 4: Первая валидная строка
+    if not cmd:
+        lines = clean.split('\n')
+        for line in lines:
+            line = line.strip()
+            # Пропускаем заголовки и пустые строки
+            if not line or line.startswith(('Команда:', 'Command:', 'Объяснение:', 
+                                           'Explanation:', '#', '//', '---')):
+                continue
             if is_valid_command(line):
-                logger.debug(f"Команда найдена в строке: {line}")
-                return {"command": line, "explanation": ""}
+                cmd = line
+                logger.debug(f"Извлечена команда (способ 4): {cmd}")
+                break
     
-    logger.warning(f"Не удалось извлечь команду из ответа: {content}")
-    return {"command": "", "explanation": "Не удалось извлечь команду из ответа"}
+    # Если команда не найдена
+    if not cmd:
+        logger.warning(f"Не удалось извлечь команду из: {clean[:200]}...")
+        # Выводим детали в консоль для отладки
+        print(f"\n⚠️  ДЕТАЛИ ПАРСИНГА:")
+        print(f"Полный ответ LLM:\n{clean}\n")
+        print(f"Причина: Не найдено валидной команды ни одним из способов парсинга")
+        return {'command':'','explanation':'Не удалось извлечь валидную команду из ответа'}
+    
+    return {'command':cmd,'explanation':expl}
 
 def is_valid_command(command: str) -> bool:
-    """Проверяет, является ли строка валидной bash командой."""
-    command = command.strip()
-    if not command:
+    """
+    Проверяет, что команда начинается с известной утилиты или пути.
+    """
+    if not command or len(command) < 2:
         return False
     
-    # Список известных команд Linux
-    common_commands = [
-        'ls', 'cd', 'pwd', 'mkdir', 'rmdir', 'rm', 'cp', 'mv', 'find', 'grep',
-        'cat', 'less', 'more', 'head', 'tail', 'wc', 'sort', 'uniq', 'cut',
-        'awk', 'sed', 'chmod', 'chown', 'ps', 'top', 'kill', 'jobs', 'nohup',
-        'df', 'du', 'free', 'mount', 'umount', 'lsblk', 'fdisk', 'fsck',
-        'tar', 'gzip', 'gunzip', 'zip', 'unzip', 'wget', 'curl', 'ssh', 'scp',
-        'systemctl', 'service', 'crontab', 'at', 'history', 'alias', 'which',
-        'whereis', 'locate', 'file', 'stat', 'ln', 'touch', 'date', 'cal',
-        'whoami', 'id', 'groups', 'su', 'sudo', 'passwd', 'useradd', 'usermod',
-        'userdel', 'groupadd', 'groupmod', 'groupdel', 'ping', 'traceroute',
-        'netstat', 'ss', 'iptables', 'ufw', 'rsync', 'screen', 'tmux', 'nano',
-        'vim', 'vi', 'emacs', 'git', 'docker', 'pip', 'python', 'node', 'npm'
-    ]
+    try:
+        parts = shlex.split(command)
+    except:
+        # Если не удалось распарсить - считаем невалидной
+        return False
     
-    # Получаем первое слово команды
-    first_word = command.split()[0]
+    if not parts:
+        return False
     
-    # Проверяем, начинается ли команда с известной утилиты
-    if first_word in common_commands:
+    tool = parts[0]
+    
+    # Относительный или абсолютный путь
+    if tool.startswith('/') or tool.startswith('./'):
         return True
     
-    # Проверяем относительные и абсолютные пути
-    if first_word.startswith('./') or first_word.startswith('/'):
+    # Чистое имя утилиты
+    if tool in COMMON_COMMANDS:
         return True
     
-    logger.debug(f"Команда '{command}' не прошла валидацию")
+    logger.debug(f"Невалидная команда: {command}")
     return False

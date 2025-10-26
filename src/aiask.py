@@ -1,11 +1,10 @@
-# aiask.py - Основная точка входа 
+# aiask.py - Основная точка входа с ранней проверкой безопасности
 
 import typer
 import logging
 from config import setup_logging
 from llm_client import generate_command
-from executor import run_command
-from interactive import interactive_loop
+from executor import run_command, is_dangerous_command
 
 # Инициализируем логирование
 setup_logging()
@@ -28,6 +27,14 @@ def ask(query: str = typer.Argument(..., help="Запрос на естеств�
             typer.echo("❌ Не удалось сгенерировать команду. Проверьте подключение к LLM.")
             logger.error("Не удалось сгенерировать команду")
             return
+        
+        # ПРОВЕРКА БЕЗОПАСНОСТИ ДО ВЫВОДА
+        if is_dangerous_command(cmd):
+            typer.echo(f"🚨 ОПАСНАЯ КОМАНДА ЗАБЛОКИРОВАНА!")
+            typer.echo(f"Команда: {cmd}")
+            typer.echo(f"⛔ Эта команда может нанести серьезный вред системе и автоматически заблокирована.")
+            logger.warning(f"Заблокирована опасная команда: {cmd}")
+            return
             
         typer.echo(f"🤖 Команда: {cmd}")
         if expl:
@@ -39,12 +46,15 @@ def ask(query: str = typer.Argument(..., help="Запрос на естеств�
             
             if code == 0:
                 typer.echo("✅ Команда выполнена успешно")
-                if out.strip():  # Показываем только непустой вывод
+                if out.strip():
                     typer.echo(out)
             else:
-                typer.echo(f"❌ Ошибка выполнения (код {code})")
+                if "превышен лимит времени" in err.lower() or "timeout" in err.lower():
+                    typer.echo(f"⏱️ Команда не завершилась вовремя (timeout)")
+                else:
+                    typer.echo(f"❌ Ошибка выполнения (код {code})")
                 if err.strip():
-                    typer.echo(f"Ошибка: {err}")
+                    typer.echo(f"Детали: {err}")
         else:
             logger.info("Пользователь отменил выполнение команды")
             typer.echo("Выполнение отменено")
@@ -60,6 +70,7 @@ def main(ctx: typer.Context):
     """
     if ctx.invoked_subcommand is None:
         logger.info("Запуск интерактивного режима")
+        from interactive import interactive_loop
         interactive_loop()
 
 if __name__ == "__main__":
