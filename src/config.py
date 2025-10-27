@@ -5,7 +5,7 @@ import os
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    model_name: str = "qwen3:1.7b"
+    model_name: str = "llama3.2:3b"
     temperature: float = 0.3
     top_k: int = 40
     top_p: float = 0.9
