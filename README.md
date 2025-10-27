@@ -58,11 +58,6 @@
 # Linux
 curl -fsSL https://ollama.ai/install.sh | sh
 
-# macOS
-brew install ollama
-
-# Windows - скачайте с https://ollama.ai
-
 # Запустите Ollama (в отдельном терминале)
 ollama serve
 
@@ -256,7 +251,7 @@ ollama pull qwen3:1.7b
 Первый запрос медленнее (10-15 сек). Это нормально для локальной модели.
 Переключитесь на меньшую модель:
 ```python
-model_name: str = "qwen3:1.7b"  # Вместо более крупной
+model_name: str = "llama3.2:3b"  # Вместо более крупной
 ```
 
 ### Парсинг не извлекает команду
