@@ -174,7 +174,7 @@ class Session:
         if len(self.context.preferred_tools) > 10:
             self.context.preferred_tools = self.context.preferred_tools[-10:]
 
-    def _update_user_metadata(self, command: str, output: str):
+    def _update_user_metadata(self, command: str, output: str, error: str = None):
         """Анализирует команды для определения уровня пользователя"""
         complex_patterns = ['awk', 'sed', 'xargs', 'find.*-exec', 'grep -P']
         if any(pattern in command for pattern in complex_patterns):
