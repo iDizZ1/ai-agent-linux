@@ -1,3 +1,4 @@
+# interactive.py
 import logging
 import os
 import time
@@ -5,6 +6,7 @@ from colorama import Fore, Style, init
 from llm_client import generate_command
 from executor import run_command, is_dangerous_command, categorize_command, CommandCategory
 from session_manager import session_manager, Session
+from database import db_manager  # ДОБАВИТЬ ЭТОТ ИМПОРТ
 
 # Инициализация colorama для цветного вывода
 init(autoreset=True)
@@ -36,6 +38,7 @@ def interactive_loop():
         print(f"{Fore.YELLOW}📝 Введите 'help' для получения помощи")
         print(f"{Fore.YELLOW}📊 Введите 'history' для просмотра истории текущей сессии")
         print(f"{Fore.YELLOW}🔧 Введите 'session' для управления сессиями")
+        print(f"{Fore.YELLOW}🗃️ Введите 'context' для просмотра контекста из БД")
         print("-" * 50)
 
         session_exit = False
@@ -64,6 +67,10 @@ def interactive_loop():
                     if restart_needed:
                         restart_required = True
                         break  # Выходим из внутреннего цикла для перезапуска
+                    continue
+                    
+                if prompt.lower() == "context":
+                    show_database_context(session)
                     continue
 
                 if prompt.lower() == "clear":
@@ -384,6 +391,51 @@ def _show_session_info(session: Session):
     print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}\n")
 
 
+def show_database_context(session):
+    """Показывает контекст из базы данных"""
+    context = db_manager.get_session_context(session.id)
+    if not context:
+        print(f"{Fore.YELLOW}📭 Контекст не найден в базе данных")
+        return
+        
+    print(f"\n{Fore.CYAN}{'=' * 60}")
+    print(f"🗃️ КОНТЕКСТ ИЗ БАЗЫ ДАННЫХ")
+    print(f"{'=' * 60}{Style.RESET_ALL}")
+    
+    # Информация о сессии
+    session_data = context['session']
+    print(f"{Fore.GREEN}📁 СЕССИЯ:")
+    print(f"  ID: {session_data['id']}")
+    print(f"  Директория: {session_data['current_working_dir']}")
+    print(f"  Уровень: {session_data['user_skill_level']}")
+    print(f"  Язык: {session_data['preferred_language']}")
+    print(f"  Доверие: {session_data['trust_level']}")
+    
+    # Предпочтения
+    if context['user_preferences']:
+        print(f"\n{Fore.BLUE}🎯 ПРЕДПОЧТЕНИЯ:")
+        for pref in context['user_preferences']:
+            success_rate = pref['success_rate'] * 100
+            print(f"  {pref['tool_name']}: {pref['usage_count']} использований, {success_rate:.1f}% успеха")
+    
+    # Знания о системе
+    if context['system_knowledge']:
+        print(f"\n{Fore.MAGENTA}📚 ИЗВЕСТНЫЕ ФАЙЛЫ/ПРОЦЕССЫ:")
+        knowledge_by_category = {}
+        for item in context['system_knowledge']:
+            category = item['category']
+            if category not in knowledge_by_category:
+                knowledge_by_category[category] = []
+            knowledge_by_category[category].append(item)
+            
+        for category, items in knowledge_by_category.items():
+            print(f"  {category.upper()}:")
+            for item in items[:3]:
+                print(f"    {item['item_path']}")
+    
+    print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}\n")
+
+
 def enhance_prompt_with_context(prompt: str, session: Session) -> str:
     """
     Умное улучшение промпта с учетом полного контекста сессии
@@ -470,8 +522,9 @@ def show_help():
 
 {Fore.YELLOW}🔧 СЛУЖЕБНЫЕ КОМАНДЫ:{Style.RESET_ALL}
   • {Fore.CYAN}help{Style.RESET_ALL}    - показать эту справку
-  • {Fore.CYAN}history{Style.RESET_ALL} - показать историю текущей сессии
+  • {Fore.CYAN}history{Style.RESET_ALL} - показать истории текущей сессии
   • {Fore.CYAN}session{Style.RESET_ALL} - управление сессиями
+  • {Fore.CYAN}context{Style.RESET_ALL} - показать контекст из БД
   • {Fore.CYAN}clear{Style.RESET_ALL}   - очистить экран
   • {Fore.CYAN}exit{Style.RESET_ALL}    - выход с сохранением сессии
 

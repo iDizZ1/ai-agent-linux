@@ -6,6 +6,7 @@ from config import setup_logging
 from llm_client import generate_command
 from executor import run_command, is_dangerous_command
 from session_manager import session_manager
+from database import db_manager
 
 # Инициализируем логирование
 setup_logging()
@@ -25,7 +26,8 @@ def ask(query: str = typer.Argument(..., help="Запрос на естеств�
     session = session_manager.create_session(f"single_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
     try:
-        enhanced_prompt = f"Одиночный запрос: {query}"
+        # ИСПОЛЬЗУЕМ РАСШИРЕННЫЙ КОНТЕКСТ ИЗ БД
+        enhanced_prompt = session.get_enhanced_context_prompt(query)
         resp = generate_command(enhanced_prompt)
         cmd, expl = resp["command"], resp.get("explanation", "")
 
