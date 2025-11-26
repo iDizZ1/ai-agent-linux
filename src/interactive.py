@@ -1,48 +1,62 @@
+# interactive.py 
+
 import logging
 import os
 import time
 from colorama import Fore, Style, init
 from llm_client import generate_command
-from executor import run_command, is_dangerous_command, categorize_command, CommandCategory
+from executor import (
+    run_command, is_dangerous_command, categorize_command, CommandCategory,
+    is_direct_command, CommandExecutor, get_global_executor
+)
 from session_manager import session_manager, Session
+
 
 # Инициализация colorama для цветного вывода
 init(autoreset=True)
+
 
 logger = logging.getLogger(__name__)
 
 
 def interactive_loop():
     """
-    Главный интерактивный цикл с поддержкой перезапуска при смене сессии
+    Главный интерактивный цикл с поддержкой сессий и многошаговых команд
     """
     restart_required = False
 
     while True:
         if restart_required:
-            # Перезапускаем цикл с новой сессией
             session = session_manager.get_or_create_current_session()
             restart_required = False
             print(f"{Fore.CYAN}🔄 Перезапуск с сессией: {session.id[:8]}...")
         else:
-            # Обычный запуск
             session = session_manager.get_or_create_current_session()
+
+        if not hasattr(session, '_executor'):
+            session._executor = CommandExecutor()
+        
+        executor = session._executor
 
         logger.info(f"Запуск интерактивного режима для сессии: {session.id}")
 
         print(f"{Fore.CYAN}🤖 Запущен интерактивный режим AI-ассистента")
         print(f"{Fore.GREEN}📁 Сессия: {session.id[:8]}...")
+        print(f"{Fore.YELLOW}🔧 Введите bash команду - без обращения к llm")
         print(f"{Fore.YELLOW}💬 Введите 'exit' или 'quit' для выхода")
         print(f"{Fore.YELLOW}📝 Введите 'help' для получения помощи")
         print(f"{Fore.YELLOW}📊 Введите 'history' для просмотра истории текущей сессии")
-        print(f"{Fore.YELLOW}🔧 Введите 'session' для управления сессиями")
+        print(f"{Fore.YELLOW}🎓 Введите 'session' для управления сессиями")
         print("-" * 50)
 
         session_exit = False
 
         while not session_exit and not restart_required:
             try:
-                prompt = input(f"{Fore.GREEN}AIask[{session.id[:8]}]> {Style.RESET_ALL}").strip()
+                current_dir = executor.get_current_directory()
+                short_dir = current_dir if len(current_dir) <= 30 else "..." + current_dir[-27:]
+                
+                prompt = input(f"{Fore.GREEN}AIask[{session.id[:8]}:{short_dir}]> {Style.RESET_ALL}").strip()
 
                 if prompt.lower() in ("exit", "quit", "q"):
                     logger.info("Выход из интерактивного режима")
@@ -63,7 +77,7 @@ def interactive_loop():
                     restart_needed = handle_session_commands(session)
                     if restart_needed:
                         restart_required = True
-                        break  # Выходим из внутреннего цикла для перезапуска
+                        break
                     continue
 
                 if prompt.lower() == "clear":
@@ -75,85 +89,13 @@ def interactive_loop():
 
                 logger.info(f"Обработка запроса: {prompt}")
 
-                # Генерируем команду с учетом контекста сессии
-                enhanced_prompt = enhance_prompt_with_context(prompt, session)
-                resp = generate_command(enhanced_prompt)
-
-                # ЗАЩИТА ОТ None и неправильного формата ответа
-                if not resp or not isinstance(resp, dict):
-                    print(f"{Fore.RED}❌ Ошибка: AI не вернул корректный ответ")
-                    logger.error(f"Некорректный ответ от generate_command: {resp}")
-                    session.add_event(prompt, "", "AI_ERROR")
-                    continue
-
-                # Безопасное извлечение данных
-                cmd = resp.get("command", "")
-                expl = resp.get("explanation", "")
-
-                if not cmd:
-                    print(f"{Fore.RED}❌ Не удалось сгенерировать команду. Попробуйте переформулировать запрос.")
-                    if expl:
-                        print(f"{Fore.YELLOW}💡 AI сообщение: {expl}")
-                    logger.warning("Не удалось сгенерировать команду")
-                    session.add_event(prompt, "", "GENERATION_ERROR")
-                    continue
-
-                # Проверка безопасности ДО вывода
-                if is_dangerous_command(cmd):
-                    print(f"{Fore.RED}🚨 ОПАСНАЯ КОМАНДА ЗАБЛОКИРОВАНА!")
-                    print(f"{Fore.YELLOW}Команда: {cmd}")
-                    print(f"{Fore.RED}⛔ Эта команда может нанести серьезный вред системы.")
-                    logger.warning(f"Заблокирована опасная команда: {cmd}")
-                    session.add_event(prompt, cmd, "BLOCKED")
-                    session_manager.save_session(session.id)
-                    continue
-
-                # Показываем категорию команды
-                category = categorize_command(cmd)
-                category_icon = {
-                    CommandCategory.SAFE: f"{Fore.GREEN}✓",
-                    CommandCategory.WRITE: f"{Fore.YELLOW}✎",
-                    CommandCategory.DANGEROUS: f"{Fore.MAGENTA}⚠",
-                    CommandCategory.CRITICAL: f"{Fore.RED}⛔"
-                }
-
-                print(f"{Fore.CYAN}🤖 Команда: {Fore.WHITE}{cmd} {category_icon.get(category, '')}")
-                if expl:
-                    print(f"{Fore.BLUE}💡 Объяснение: {expl}")
-
-                # Подтверждение выполнения
-                confirm = input(f"{Fore.YELLOW}Выполнить? [y/N]: {Style.RESET_ALL}").strip().lower()
-
-                if confirm in ('y', 'yes', 'да'):
-                    logger.info("Пользователь подтвердил выполнение")
-
-                    start_time = time.time()
-                    code, out, err = run_command(cmd)
-                    execution_time = time.time() - start_time
-
-                    if code == 0:
-                        print(f"{Fore.GREEN}✅ Команда выполнена успешно")
-                        if out.strip():
-                            print(f"{Style.RESET_ALL}{out}")
-
-                        # Обновляем контекст сессии
-                        session.update_context_from_command(cmd, out)
-                        session.add_event(prompt, cmd, "SUCCESS", out, None, execution_time)
-                    else:
-                        if "превышен лимит времени" in err.lower() or "timeout" in err.lower():
-                            print(f"{Fore.YELLOW}⏱️ Команда не завершилась вовремя (timeout)")
-                        else:
-                            print(f"{Fore.RED}❌ Ошибка выполнения (код {code})")
-                        if err.strip():
-                            print(f"{Fore.RED}Детали: {err}")
-                        session.add_event(prompt, cmd, "ERROR", out, err, execution_time)
-
-                    # Авто-сохранение после выполнения
-                    session_manager.save_session(session.id)
+                # Автоматический детектор команд
+                if is_direct_command(prompt):
+                    # Прямая bash команда
+                    handle_direct_command(prompt, executor, session)
                 else:
-                    logger.info("Пользователь отменил выполнение")
-                    print(f"{Fore.YELLOW}⏭️ Выполнение пропущено")
-                    session.add_event(prompt, cmd, "CANCELLED")
+                    # AI запрос
+                    handle_ai_request(prompt, executor, session)
 
             except KeyboardInterrupt:
                 logger.info("Прерывание через Ctrl+C")
@@ -170,14 +112,311 @@ def interactive_loop():
                     session.add_event(prompt, "", "SYSTEM_ERROR", error=str(e))
 
         if session_exit:
-            break  # Полный выход из программы
+            break
+
+
+def handle_direct_command(cmd: str, executor: CommandExecutor, session: Session):
+    """Обрабатывает прямую bash команду"""
+    logger.info(f"Прямая bash команда: {cmd}")
+
+    if is_dangerous_command(cmd):
+        print(f"{Fore.RED}🚨 ОПАСНАЯ КОМАНДА ЗАБЛОКИРОВАНА!")
+        print(f"{Fore.YELLOW}Команда: {cmd}")
+        print(f"{Fore.RED}⛔ Эта команда может нанести серьезный вред системе.")
+        logger.warning(f"Заблокирована опасная команда: {cmd}")
+        session.add_event(cmd, cmd, "BLOCKED")
+        session_manager.save_session(session.id)
+        return
+
+    category = categorize_command(cmd)
+    category_icon = {
+        CommandCategory.SAFE: f"{Fore.GREEN}✓",
+        CommandCategory.WRITE: f"{Fore.YELLOW}✎",
+        CommandCategory.DANGEROUS: f"{Fore.MAGENTA}⚠",
+        CommandCategory.CRITICAL: f"{Fore.RED}⛔",
+        CommandCategory.BUILTIN: f"{Fore.CYAN}⚙"
+    }
+
+    print(f"{Fore.CYAN}🔧 Команда: {Fore.WHITE}{cmd} {category_icon.get(category, '')}")
+
+    confirm = input(f"{Fore.YELLOW}Выполнить? [y/N]: {Style.RESET_ALL}").strip().lower()
+
+    if confirm in ('y', 'yes', 'да'):
+        logger.info("Пользователь подтвердил выполнение")
+
+        start_time = time.time()
+        code, out, err = run_command(cmd, executor)
+        execution_time = time.time() - start_time
+
+        if code == 0:
+            print(f"{Fore.GREEN}✅ Команда выполнена успешно")
+            if out.strip():
+                print(f"{Style.RESET_ALL}{out}")
+
+            session.update_context_from_executor(executor)
+            session.add_event(cmd, cmd, "SUCCESS", out, None, execution_time)
+        else:
+            if "превышен лимит времени" in err.lower() or "timeout" in err.lower():
+                print(f"{Fore.YELLOW}⏱️ Команда не завершилась вовремя (timeout)")
+            else:
+                print(f"{Fore.RED}❌ Ошибка выполнения (код {code})")
+            if err.strip():
+                print(f"{Fore.RED}Детали: {err}")
+            session.add_event(cmd, cmd, "ERROR", out, err, execution_time)
+
+        session_manager.save_session(session.id)
+    else:
+        logger.info("Пользователь отменил выполнение")
+        print(f"{Fore.YELLOW}⏭️ Выполнение пропущено")
+        session.add_event(cmd, cmd, "CANCELLED")
+
+
+def handle_ai_request(prompt: str, executor: CommandExecutor, session: Session):
+    """Обрабатывает запрос к AI"""
+    logger.info(f"AI запрос: {prompt}")
+
+    enhanced_prompt = enhance_prompt_with_context(prompt, session, executor)
+    resp = generate_command(enhanced_prompt)
+
+    if not resp or not isinstance(resp, dict):
+        print(f"{Fore.RED}❌ Ошибка: AI не вернул корректный ответ")
+        logger.error(f"Некорректный ответ от generate_command: {resp}")
+        session.add_event(prompt, "", "AI_ERROR")
+        return
+
+    # ✨ НОВОЕ: Проверяем есть ли несколько команд
+    if 'commands' in resp and resp.get('commands'):
+        # Многошаговые команды!
+        handle_multi_commands(resp['commands'], resp.get('explanations', []), 
+                            prompt, executor, session)
+    else:
+        # Одиночная команда
+        handle_single_command(resp, prompt, executor, session)
+
+
+def handle_single_command(resp: dict, original_prompt: str, 
+                         executor: CommandExecutor, session: Session):
+    """Обрабатывает одиночную команду"""
+    cmd = resp.get("command", "")
+    expl = resp.get("explanation", "")
+
+    if not cmd:
+        print(f"{Fore.RED}❌ Не удалось сгенерировать команду. Попробуйте переформулировать запрос.")
+        if expl:
+            print(f"{Fore.YELLOW}💡 AI сообщение: {expl}")
+        logger.warning("Не удалось сгенерировать команду")
+        session.add_event(original_prompt, "", "GENERATION_ERROR")
+        return
+
+    if is_dangerous_command(cmd):
+        print(f"{Fore.RED}🚨 ОПАСНАЯ КОМАНДА ЗАБЛОКИРОВАНА!")
+        print(f"{Fore.YELLOW}Команда: {cmd}")
+        print(f"{Fore.RED}⛔ Эта команда может нанести серьезный вред системе.")
+        logger.warning(f"Заблокирована опасная команда: {cmd}")
+        session.add_event(original_prompt, cmd, "BLOCKED")
+        session_manager.save_session(session.id)
+        return
+
+    category = categorize_command(cmd)
+    category_icon = {
+        CommandCategory.SAFE: f"{Fore.GREEN}✓",
+        CommandCategory.WRITE: f"{Fore.YELLOW}✎",
+        CommandCategory.DANGEROUS: f"{Fore.MAGENTA}⚠",
+        CommandCategory.CRITICAL: f"{Fore.RED}⛔",
+        CommandCategory.BUILTIN: f"{Fore.CYAN}⚙"
+    }
+
+    print(f"{Fore.CYAN}🤖 Команда: {Fore.WHITE}{cmd} {category_icon.get(category, '')}")
+    if expl:
+        print(f"{Fore.BLUE}💡 Объяснение: {expl}")
+
+    confirm = input(f"{Fore.YELLOW}Выполнить? [y/N]: {Style.RESET_ALL}").strip().lower()
+
+    if confirm in ('y', 'yes', 'да'):
+        logger.info("Пользователь подтвердил выполнение")
+
+        start_time = time.time()
+        code, out, err = run_command(cmd, executor)
+        execution_time = time.time() - start_time
+
+        if code == 0:
+            print(f"{Fore.GREEN}✅ Команда выполнена успешно")
+            if out.strip():
+                print(f"{Style.RESET_ALL}{out}")
+
+            session.update_context_from_executor(executor)
+            session.add_event(original_prompt, cmd, "SUCCESS", out, None, execution_time)
+        else:
+            if "превышен лимит времени" in err.lower() or "timeout" in err.lower():
+                print(f"{Fore.YELLOW}⏱️ Команда не завершилась вовремя (timeout)")
+            else:
+                print(f"{Fore.RED}❌ Ошибка выполнения (код {code})")
+            if err.strip():
+                print(f"{Fore.RED}Детали: {err}")
+            session.add_event(original_prompt, cmd, "ERROR", out, err, execution_time)
+
+        session_manager.save_session(session.id)
+    else:
+        logger.info("Пользователь отменил выполнение")
+        print(f"{Fore.YELLOW}⏭️ Выполнение пропущено")
+        session.add_event(original_prompt, cmd, "CANCELLED")
+
+
+def handle_multi_commands(commands: list, explanations: list, original_prompt: str,
+                         executor: CommandExecutor, session: Session):
+    """Обрабатывает несколько команд с выбором режима выполнения"""
+    logger.info(f"Многошаговые команды: {len(commands)} команд")
+
+    # Показываем все команды
+    print(f"\n{Fore.CYAN}🔍 Найдено {len(commands)} команд для выполнения:\n")
+
+    for i, cmd in enumerate(commands, 1):
+        category = categorize_command(cmd)
+        category_icon = {
+            CommandCategory.SAFE: f"{Fore.GREEN}✓",
+            CommandCategory.WRITE: f"{Fore.YELLOW}✎",
+            CommandCategory.DANGEROUS: f"{Fore.MAGENTA}⚠",
+            CommandCategory.CRITICAL: f"{Fore.RED}⛔",
+            CommandCategory.BUILTIN: f"{Fore.CYAN}⚙"
+        }
+        print(f"{Fore.WHITE}{i}. {cmd} {category_icon.get(category, '')}")
+
+    # Проверяем безопасность всех команд
+    dangerous_cmds = [cmd for cmd in commands if is_dangerous_command(cmd)]
+    if dangerous_cmds:
+        print(f"\n{Fore.RED}🚨 ОПАСНЫЕ КОМАНДЫ НАЙДЕНЫ:")
+        for cmd in dangerous_cmds:
+            print(f"  {Fore.RED}⛔ {cmd}")
+        print(f"{Fore.RED}Выполнение отменено.")
+        session.add_event(original_prompt, "; ".join(commands), "BLOCKED")
+        session_manager.save_session(session.id)
+        return
+
+    # Меню выбора
+    print(f"\n{Fore.CYAN}Как выполнить?")
+    print(f"{Fore.GREEN}[1]{Style.RESET_ALL} Выполнить все сразу (быстро)")
+    print(f"{Fore.GREEN}[2]{Style.RESET_ALL} Выполнить пошагово (с подтверждением)")
+    print(f"{Fore.GREEN}[3]{Style.RESET_ALL} Отменить выполнение")
+
+    choice = input(f"\n{Fore.YELLOW}> {Style.RESET_ALL}").strip()
+
+    if choice == "1":
+        # Выполнить все сразу
+        execute_all_commands(commands, explanations, original_prompt, executor, session)
+    elif choice == "2":
+        # Выполнить пошагово
+        execute_stepwise_commands(commands, explanations, original_prompt, executor, session)
+    elif choice == "3":
+        # Отменить
+        print(f"{Fore.YELLOW}⏭️ Выполнение отменено")
+        session.add_event(original_prompt, "; ".join(commands), "CANCELLED")
+    else:
+        print(f"{Fore.YELLOW}❓ Неверный выбор")
+
+
+def execute_all_commands(commands: list, explanations: list, original_prompt: str,
+                        executor: CommandExecutor, session: Session):
+    """Выполняет все команды без подтверждения"""
+    print(f"\n{Fore.CYAN}⚡ Выполнение всех команд...\n")
+
+    start_time = time.time()
+    successful = 0
+    failed = 0
+    all_outputs = []
+
+    for i, cmd in enumerate(commands, 1):
+        print(f"{Fore.WHITE}[{i}/{len(commands)}] {cmd}")
+
+        code, out, err = run_command(cmd, executor)
+
+        if code == 0:
+            print(f"{Fore.GREEN}✅ Успешно")
+            successful += 1
+            if out.strip():
+                print(f"{Style.RESET_ALL}{out}")
+            all_outputs.append(out)
+        else:
+            print(f"{Fore.RED}❌ Ошибка (код {code})")
+            failed += 1
+            if err.strip():
+                print(f"{Fore.RED}{err}")
+            all_outputs.append(err)
+
+    execution_time = time.time() - start_time
+
+    # Итоговая статистика
+    print(f"\n{Fore.CYAN}{'='*50}")
+    print(f"✅ Успешно: {successful}/{len(commands)}")
+    print(f"❌ Ошибок: {failed}/{len(commands)}")
+    print(f"⏱️ Время: {execution_time:.2f}с")
+    print(f"{Fore.CYAN}{'='*50}\n")
+
+    session.update_context_from_executor(executor)
+    session.add_event(original_prompt, "; ".join(commands), 
+                     "SUCCESS" if failed == 0 else "PARTIAL_ERROR",
+                     "\n".join(all_outputs), None, execution_time)
+    session_manager.save_session(session.id)
+
+
+def execute_stepwise_commands(commands: list, explanations: list, original_prompt: str,
+                             executor: CommandExecutor, session: Session):
+    """Выполняет команды пошагово с подтверждением"""
+    print(f"\n{Fore.CYAN}🔄 Пошаговое выполнение\n")
+
+    start_time = time.time()
+    successful = 0
+    failed = 0
+    skipped = 0
+    all_outputs = []
+
+    for i, cmd in enumerate(commands, 1):
+        print(f"{Fore.WHITE}[{i}/{len(commands)}] {cmd}")
+        if i <= len(explanations) and explanations[i-1]:
+            print(f"{Fore.BLUE}💡 {explanations[i-1]}")
+
+        confirm = input(f"{Fore.YELLOW}Выполнить? [y/N]: {Style.RESET_ALL}").strip().lower()
+
+        if confirm not in ('y', 'yes', 'да'):
+            print(f"{Fore.YELLOW}⏭️ Пропущено\n")
+            skipped += 1
+            continue
+
+        code, out, err = run_command(cmd, executor)
+
+        if code == 0:
+            print(f"{Fore.GREEN}✅ Успешно")
+            successful += 1
+            if out.strip():
+                print(f"{Style.RESET_ALL}{out}")
+            all_outputs.append(out)
+        else:
+            print(f"{Fore.RED}❌ Ошибка (код {code})")
+            failed += 1
+            if err.strip():
+                print(f"{Fore.RED}{err}")
+            all_outputs.append(err)
+
+        print()
+
+    execution_time = time.time() - start_time
+
+    # Итоговая статистика
+    print(f"\n{Fore.CYAN}{'='*50}")
+    print(f"✅ Успешно: {successful}/{len(commands)}")
+    print(f"❌ Ошибок: {failed}/{len(commands)}")
+    print(f"⏭️ Пропущено: {skipped}/{len(commands)}")
+    print(f"⏱️ Время: {execution_time:.2f}с")
+    print(f"{Fore.CYAN}{'='*50}\n")
+
+    session.update_context_from_executor(executor)
+    status = "SUCCESS" if failed == 0 else "PARTIAL_ERROR"
+    session.add_event(original_prompt, "; ".join(commands), status,
+                     "\n".join(all_outputs), None, execution_time)
+    session_manager.save_session(session.id)
 
 
 def handle_session_commands(session: Session) -> bool:
-    """
-    Обрабатывает команды управления сессиями
-    Возвращает True если требуется перезапуск цикла
-    """
+    """Обрабатывает команды управления сессиями"""
     print(f"\n{Fore.CYAN}🔄 УПРАВЛЕНИЕ СЕССИЯМИ")
     print(f"{Fore.GREEN}Текущая сессия: {session.id}")
 
@@ -202,7 +441,7 @@ def handle_session_commands(session: Session) -> bool:
     command = input(f"\n{Fore.YELLOW}session> {Style.RESET_ALL}").strip().lower()
 
     if command == "back":
-        return False  # Не требуется перезапуск
+        return False
 
     if command == "list":
         sessions_list = session_manager.list_sessions()
@@ -214,15 +453,11 @@ def handle_session_commands(session: Session) -> bool:
         return False
 
     elif command == "new":
-        # Сохраняем текущую сессию перед созданием новой
         session_manager.save_session(session.id)
-
         new_session = session_manager.create_session()
         print(f"{Fore.GREEN}✅ Создана новая сессия: {new_session.id}")
-
-        # Переключаемся на новую сессию
         session_manager.switch_session(new_session.id)
-        return True  # Требуется перезапуск цикла
+        return True
 
     elif command == "save":
         session_manager.save_session(session.id)
@@ -230,21 +465,17 @@ def handle_session_commands(session: Session) -> bool:
         return False
 
     elif command.startswith("switch "):
-        # Сохраняем текущую сессию перед переключением
         session_manager.save_session(session.id)
-
         target_id = command[7:].strip()
 
-        # Прямой поиск по полному ID
         if target_id in session_manager.sessions:
             if session_manager.switch_session(target_id):
                 print(f"{Fore.GREEN}✅ Переключено на сессию: {target_id}")
-                return True  # Требуется перезапуск цикла
+                return True
             else:
                 print(f"{Fore.RED}❌ Ошибка переключения")
                 return False
         else:
-            # Поиск по префиксу
             matching_sessions = []
             for session_id in session_manager.sessions.keys():
                 if session_id.startswith(target_id):
@@ -254,7 +485,7 @@ def handle_session_commands(session: Session) -> bool:
                 full_id = matching_sessions[0]
                 if session_manager.switch_session(full_id):
                     print(f"{Fore.GREEN}✅ Переключено на сессию: {full_id}")
-                    return True  # Требуется перезапуск цикла
+                    return True
                 else:
                     print(f"{Fore.RED}❌ Ошибка переключения")
                     return False
@@ -270,13 +501,10 @@ def handle_session_commands(session: Session) -> bool:
 
     elif command.startswith("info "):
         target_id = command[5:].strip()
-
-        # Находим сессию
         target_session = None
         if target_id in session_manager.sessions:
             target_session = session_manager.sessions[target_id]
         else:
-            # Поиск по префиксу
             matching_sessions = [sid for sid in session_manager.sessions.keys()
                                  if sid.startswith(target_id)]
             if len(matching_sessions) == 1:
@@ -296,18 +524,15 @@ def handle_session_commands(session: Session) -> bool:
     elif command.startswith("delete "):
         target_id = command[7:].strip()
 
-        # Нельзя удалить текущую сессию
         if target_id == session.id or target_id == session.id[:8]:
             print(f"{Fore.RED}❌ Нельзя удалить текущую сессию!")
             print(f"{Fore.YELLOW}💡 Переключитесь на другую сессию сначала")
             return False
 
-        # Находим сессию для удаления
         session_to_delete = None
         if target_id in session_manager.sessions:
             session_to_delete = target_id
         else:
-            # Поиск по префиксу
             matching_sessions = [sid for sid in session_manager.sessions.keys()
                                  if sid.startswith(target_id)]
             if len(matching_sessions) == 1:
@@ -320,12 +545,10 @@ def handle_session_commands(session: Session) -> bool:
 
         if session_to_delete:
             if session_to_delete in session_manager.sessions:
-                # Удаляем файл сессии
                 session_file = session_manager.storage_path / f"{session_to_delete}.json"
                 if session_file.exists():
                     os.remove(session_file)
 
-                # Удаляем из менеджера
                 del session_manager.sessions[session_to_delete]
                 print(f"{Fore.GREEN}✅ Сессия удалена: {session_to_delete}")
             else:
@@ -384,19 +607,14 @@ def _show_session_info(session: Session):
     print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}\n")
 
 
-def enhance_prompt_with_context(prompt: str, session: Session) -> str:
-    """
-    Умное улучшение промпта с учетом полного контекста сессии
-    Без эмодзи - только чистый текст для модели
-    """
+def enhance_prompt_with_context(prompt: str, session: Session, executor: CommandExecutor) -> str:
+    """Улучшает промпт с контекстом сессии"""
     context_parts = []
 
-    # 1. ТЕКУЩЕЕ СОСТОЯНИЕ СИСТЕМЫ
     context_parts.append("КОНТЕКСТ СИСТЕМЫ:")
-    context_parts.append(f"- Рабочая директория: {session.context.current_working_dir}")
+    context_parts.append(f"- Рабочая директория: {executor.get_current_directory()}")
     context_parts.append(f"- Уровень пользователя: {session.metadata.get('user_skill_level', 'beginner')}")
 
-    # 2. АНАЛИЗ ПОСЛЕДНИХ КОМАНД
     recent_events = session.get_recent_events(3)
 
     if recent_events:
@@ -407,66 +625,42 @@ def enhance_prompt_with_context(prompt: str, session: Session) -> str:
             if event.output and len(event.output.strip()) < 50 and event.status == "SUCCESS":
                 context_parts.append(f"  Результат: {event.output.strip()}")
 
-    # 3. АНАЛИЗ ТЕКУЩЕГО ЗАПРОСА
     prompt_lower = prompt.lower()
 
-    # Определяем тип текущего запроса для лучшего контекста
     if any(word in prompt_lower for word in ['найди', 'поиск', 'find', 'search', 'grep']):
         context_parts.append("\nТИП ЗАПРОСА: ПОИСК")
-        context_parts.append("Пользователь ищет файлы или информацию в системе")
 
     elif any(word in prompt_lower for word in ['создай', 'сделай', 'create', 'make', 'mkdir', 'touch']):
         context_parts.append(f"\nТИП ЗАПРОСА: СОЗДАНИЕ")
-        context_parts.append(f"Текущее местоположение: {session.context.current_working_dir}")
+        context_parts.append(f"Текущее местоположение: {executor.get_current_directory()}")
 
-    elif any(word in prompt_lower for word in ['удали', 'удалить', 'remove', 'delete', 'rm']):
-        context_parts.append("\nТИП ЗАПРОСА: УДАЛЕНИЕ")
-        context_parts.append("ВНИМАНИЕ: Это операция удаления - будьте осторожны")
-
-    elif any(word in prompt_lower for word in ['покажи', 'открой', 'show', 'display', 'cat', 'less']):
-        context_parts.append("\nТИП ЗАПРОСА: ПРОСМОТР")
-        context_parts.append("Пользователь хочет просмотреть содержимое файлов или директорий")
-
-    # 4. УЧЕТ ПРЕДЫДУЩИХ ОШИБОК
-    recent_errors = [e for e in recent_events if e.status == "ERROR"]
-    if recent_errors:
-        context_parts.append("\nПРЕДЫДУЩИЕ ОШИБКИ (избегайте повторения):")
-        for error in recent_errors[-2:]:
-            error_msg = error.error[:100] + "..." if len(error.error) > 100 else error.error
-            context_parts.append(f"- {error.command}")
-            context_parts.append(f"  Ошибка: {error_msg}")
-
-    # 5. АДАПТАЦИЯ К УРОВНЮ ПОЛЬЗОВАТЕЛЯ
-    user_level = session.metadata.get("user_skill_level", "beginner")
-    if user_level == "beginner":
-        context_parts.append("\nРЕКОМЕНДАЦИЯ: Используйте простые и безопасные команды")
-    elif user_level == "advanced":
-        context_parts.append("\nРЕКОМЕНДАЦИЯ: Можно использовать сложные команды (awk, sed, pipes)")
-
-    # Собираем финальный промпт
     context_str = "\n".join(context_parts)
 
     enhanced_prompt = f"""{context_str}
 
+
 ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {prompt}
 
-СГЕНЕРИРУЙТЕ БАШ-КОМАНДУ:"""
 
-    logger.debug(f"Улучшенный промпт (чистый текст): {context_str}")
+СГЕНЕРИРУЙТЕ БАШ-КОМАНДУ (ИЛИ НЕСКОЛЬКО КОМАНД ЕСЛИ НУЖНО):"""
+
+    logger.debug(f"Улучшенный промпт: {context_str}")
     return enhanced_prompt
 
 
 def show_help():
-    """Показывает справку с улучшенным форматированием"""
+    """Показывает справку"""
     help_text = f"""
 {Fore.CYAN}{'=' * 60}
-🆘 СПРАВКА ПО AI-АССИСТЕНТУ (СЕССИИ)
+🆘 СПРАВКА ПО AI-АССИСТЕНТУ
 {'=' * 60}{Style.RESET_ALL}
 
+
 {Fore.GREEN}📌 ОСНОВНЫЕ КОМАНДЫ:{Style.RESET_ALL}
-  • Просто опишите что хотите сделать на русском языке
+  • Вводите прямые bash команды: ls -la, mkdir test, cd /tmp и т.д.
+  • Опишите что хотите на русском языке - AI сгенерирует команду
   • Система запоминает контекст между командами
-  • Автоматическое сохранение истории
+
 
 {Fore.YELLOW}🔧 СЛУЖЕБНЫЕ КОМАНДЫ:{Style.RESET_ALL}
   • {Fore.CYAN}help{Style.RESET_ALL}    - показать эту справку
@@ -475,16 +669,28 @@ def show_help():
   • {Fore.CYAN}clear{Style.RESET_ALL}   - очистить экран
   • {Fore.CYAN}exit{Style.RESET_ALL}    - выход с сохранением сессии
 
-{Fore.BLUE}💡 СЕССИИ И КОНТЕКСТ:{Style.RESET_ALL}
+
+{Fore.BLUE}💡 МНОГОШАГОВЫЕ КОМАНДЫ:{Style.RESET_ALL}
+  AIask> создай папку gdrrig, перейди в нее и там создай 2 файла
+  
+  🔍 Найдено 4 команды для выполнения:
+  1. mkdir gdrrig ✎
+  2. cd gdrrig ⚙
+  3. touch file1.txt ✎
+  4. touch file2.txt ✎
+  
+  Как выполнить?
+  [1] Выполнить все сразу (быстро)
+  [2] Выполнить пошагово (с подтверждением)
+  [3] Отменить выполнение
+
+
+{Fore.MAGENTA}📊 СЕССИИ И КОНТЕКСТ:{Style.RESET_ALL}
   • Каждая сессия сохраняет историю и контекст
   • Автоматическое определение уровня пользователя
-  • Сохранение рабочей директории
+  • Сохранение рабочей директории (поддержка cd)
   • Статистика успешности команд
 
-{Fore.MAGENTA}📊 ЛОГИРОВАНИЕ:{Style.RESET_ALL}
-  • Сессии сохраняются в {Fore.CYAN}sessions/{Style.RESET_ALL}
-  • Полная история всех взаимодействий
-  • Возможность переключения между сессиями
 
 {Fore.CYAN}{'=' * 60}{Style.RESET_ALL}
 """
@@ -501,7 +707,7 @@ def show_session_history(session: Session):
     print(f"📜 ИСТОРИЯ СЕССИИ {session.id[:8]}... ({len(session.events)} команд)")
     print(f"{'=' * 60}{Style.RESET_ALL}\n")
 
-    for i, event in enumerate(session.events[-10:], 1):  # Последние 10 команд
+    for i, event in enumerate(session.events[-10:], 1):
         status_icon = {
             "SUCCESS": f"{Fore.GREEN}✅",
             "ERROR": f"{Fore.RED}❌",

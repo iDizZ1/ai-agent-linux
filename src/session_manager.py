@@ -79,6 +79,12 @@ class Session:
 
         logger.info(f"Добавлено событие в сессию {self.id}: {status}")
         return event
+    def update_context_from_executor(self, executor):
+        """Обновляет контекст сессии на основе состояния executor"""
+        self.context.current_working_dir = executor.get_current_directory()
+        self.context.environment_vars.update(executor.environment_vars)
+        logger.info(f"Контекст сессии обновлен: {self.context.current_working_dir}")
+
 
     def get_recent_events(self, count: int = 10) -> List[SessionEvent]:
         """Возвращает последние события"""

@@ -1,4 +1,4 @@
-# config.py - Конфигурация с логированием (ИСПРАВЛЕНО для вывода в консоль)
+# config.py - Конфигурация с логированием 
 
 import logging
 import os
@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     timeout: int = 30
     log_level: str = "INFO"
     log_file: str = "aiask.log"
-    console_logging: bool = True  # ИЗМЕНЕНО: теперь True по умолчанию
+    console_logging: bool = True  
 
 settings = Settings()
 
