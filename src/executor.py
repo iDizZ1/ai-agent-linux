@@ -1,5 +1,3 @@
-# executor.py 
-
 import subprocess
 import logging
 import os
