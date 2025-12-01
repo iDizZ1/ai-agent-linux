@@ -1,308 +1,202 @@
-# llm_client.py 
-
 import requests
-import re
-import shlex
 import logging
+import json
+from typing import Dict, Optional, List
+
 from config import settings
+
+try:
+    from rag_knowledge import get_rag_context
+
+    HAS_RAG = True
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.info("RAG система инициализирована (текстовый поиск)")
+except ImportError:
+    HAS_RAG = False
 
 logger = logging.getLogger(__name__)
 
-API_URL = "http://localhost:11434/v1/chat/completions"
+OLLAMA_URL = "http://localhost:11434"
 
 
-# Whitelist утилит
-COMMON_COMMANDS = {
-    'ls', 'cd', 'pwd', 'mkdir', 'rmdir', 'rm', 'cp', 'mv', 'find', 'grep', 'cat',
-    'less', 'more', 'head', 'tail', 'wc', 'sort', 'uniq', 'cut', 'awk', 'sed',
-    'chmod', 'chown', 'ps', 'top', 'kill', 'jobs', 'df', 'du', 'free', 'tar',
-    'gzip', 'gunzip', 'zip', 'unzip', 'wget', 'curl', 'ssh', 'scp', 'docker', 'git',
-    'python', 'node', 'npm', 'pip', 'sudo', 'touch', 'echo', 'man', 'export', 'history'
+def generate_command(prompt: str, use_rag: bool = True) -> Dict:
+    """
+    Генерирует bash команду используя модель через ollama
+    с поддержкой RAG контекста (текстовый поиск).
+
+    Args:
+        prompt: исходный промпт пользователя (может быть на русском)
+        use_rag: использовать RAG контекст из базы знаний
+
+    Returns:
+        Dict с полями:
+        - command: сгенерированная bash команда
+        - explanation: объяснение на русском
+    """
+    logger.info(f"Генерирование команды: {prompt[:50]}...")
+
+    enhanced_prompt = prompt
+    if use_rag and HAS_RAG:
+        try:
+            rag_context = get_rag_context(prompt, top_k=3)
+            if rag_context:
+                enhanced_prompt = f"""{rag_context}
+
+ПОЛЬЗОВАТЕЛЬСКИЙ ЗАПРОС: {prompt}
+
+Используя примеры из базы знаний выше, сгенерируйте оптимальную bash команду:"""
+                logger.info("RAG контекст добавлен к промпту")
+        except Exception as e:
+            logger.warning(f"Ошибка RAG: {e}")
+
+    system_prompt = """Ты помощник для генерации bash команд.
+
+ВАЖНО:
+1. Отвечай ТОЛЬКО валидными bash командами
+2. Если нужно несколько команд - разделяй их && или ;
+3. Объясняй на русском что делает команда
+4. Форматируй ответ как JSON:
+
+{
+"command": "команда или команды",
+"explanation": "объяснение на русском"
 }
 
+БЕЗОПАСНОСТЬ:
+- НИКОГДА не генерируй команды с rm -rf / или подобные
+- Добавляй флаги для безопасности (-i для rm, --dry-run для опасных)
+- Если команда потенциально опасна - предупреди пользователя"""
 
-def generate_command(prompt: str) -> dict:
+    try:
+        logger.debug(f"Отправка запроса к ollama ({settings.model_name})...")
+
+        # ИСПРАВЛЕНО: Удалены top_k и top_p - они не поддерживаются /api/generate!
+        response = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": settings.model_name,
+                "prompt": f"{system_prompt}\n\n{enhanced_prompt}",  # system в prompt
+                "stream": False,
+                "options": {  # Все параметры в options!
+                    "temperature": settings.temperature,
+                    "top_k": settings.top_k,
+                    "top_p": settings.top_p
+                }
+            },
+            timeout=settings.timeout
+        )
+
+        response.raise_for_status()
+        result = response.json()
+
+        if "response" not in result:
+            logger.error(f"Некорректный ответ от ollama: {result}")
+            return _fallback_response(prompt)
+
+        response_text = result["response"].strip()
+        logger.debug(f"Ответ получен ({len(response_text)} символов)")
+
+        parsed = _parse_model_response(response_text)
+        if not parsed:
+            logger.warning("Не удалось распарсить JSON ответ")
+            return _fallback_response(prompt)
+
+        logger.info(f"Команда сгенерирована: {parsed.get('command', '')[:50]}...")
+        return parsed
+
+    except requests.exceptions.ConnectionError:
+        logger.error(f"Ошибка подключения к ollama на {OLLAMA_URL}")
+        logger.error("   Убедитесь что Ollama запущена: ollama serve")
+        return _fallback_response(prompt)
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout при обращении к ollama (timeout={settings.timeout}s)")
+        return _fallback_response(prompt)
+    except Exception as e:
+        logger.error(f"Ошибка при генерировании команды: {e}")
+        return _fallback_response(prompt)
+
+
+def _parse_model_response(response_text: str) -> Optional[Dict]:
     """
-    Отправляет запрос к локальному серверу Ollama.
-    Возвращает словарь с командой/командами.
+    Парсит JSON из ответа модели
+
+    Args:
+        response_text: текст ответа от модели
+
+    Returns:
+        Распарсенный JSON или None
     """
-    default_response = {'command': '', 'explanation': 'Не удалось сгенерировать команду'}
+    import re
 
-    system_prompt = (
-        "Ты — AI ассистент для Linux. Ты получаешь запрос пользователя и ДОЛЖЕН сгенерировать команды ДЛЯ ЭТОГО КОНКРЕТНОГО ЗАПРОСА.\n\n"
-        "=== ФОРМАТЫ ОТВЕТОВ ===\n\n"
-        "НЕСКОЛЬКО КОМАНД (если нужна последовательность):\n"
-        "Команда: <cmd1>\n"
-        "Команда: <cmd2>\n"
-        "Команда: <cmd3>\n"
-        "Объяснение: <общее объяснение>\n\n"
-        "ОДНА КОМАНДА:\n"
-        "Команда: <cmd>\n"
-        "Объяснение: <объяснение>\n\n"
-        "=== КРИТИЧЕСКИ ВАЖНО ===\n\n"
-        "✅ ВСЕГДА используй ИМЕ­НА И АРГУМЕНТЫ ИЗ ТЕКУЩЕГО ЗАПРОСА!\n"
-        "❌ НЕ генерируй команды из предыдущих запросов!\n"
-        "✅ Команда ДОЛЖНА быть полной с ВСЕ АРГУМЕНТАМИ\n"
-        "✅ Не используй markdown, только простой текст\n\n"
-        "=== ПРИМЕРЫ ===\n\n"
-        "Запрос: Создай директорию mynewdir\n"
-        "Ответ:\n"
-        "Команда: mkdir mynewdir\n"
-        "Объяснение: Создание директории mynewdir\n\n"
-        "Запрос: Создай папку data, перейди в нее, создай файл config.json\n"
-        "Ответ:\n"
-        "Команда: mkdir data\n"
-        "Команда: cd data\n"
-        "Команда: touch config.json\n"
-        "Объяснение: Создание папки data, переход в нее и создание файла config.json\n\n"
-        "=== ОСНОВНЫЕ ПРАВИЛА ===\n"
-        "- Генерируй ТОЛЬКО валидные bash команды\n"
-        "- ВСЕГДА используй параметры ИЗ ЗАПРОСА\n"
-        "- Для многошаговых задач: создание → переход → работа\n"
-        "- Не спрашивай подтверждение, просто генерируй"
-    )
+    json_match = re.search(r'\{[\s\S]*\}', response_text)
+    if not json_match:
+        logger.warning("JSON блок не найден в ответе")
+        logger.debug(f"   Ответ: {response_text[:200]}")
+        return None
 
-    payload = {
-        'model': settings.model_name,
-        'messages': [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': prompt}
-        ],
-        'temperature': settings.temperature,
-        'top_k': settings.top_k,
-        'top_p': settings.top_p,
-        'stream': False
+    json_str = json_match.group(0)
+
+    try:
+        data = json.loads(json_str)
+
+        if "command" not in data:
+            logger.warning("В ответе нет поля 'command'")
+            return None
+
+        if "explanation" not in data:
+            data["explanation"] = ""
+
+        logger.debug(f"JSON распарсен успешно")
+        return data
+
+    except json.JSONDecodeError as e:
+        logger.warning(f"Ошибка при парсинге JSON: {e}")
+        logger.debug(f"   Попытка парсить: {json_str[:100]}")
+        return None
+
+
+def _fallback_response(prompt: str) -> Dict:
+    """Возвращает fallback ответ если модель не доступна"""
+    return {
+        "command": "echo 'Model not available'",
+        "explanation": "Model failed to process request. Check Ollama connection.",
+        "error": True
     }
 
+
+def test_ollama_connection() -> bool:
+    """Проверяет подключение к ollama"""
     try:
-        resp = requests.post(API_URL, json=payload, timeout=settings.timeout)
-        resp.raise_for_status()
-        content = resp.json()['choices'][0]['message']['content']
-        logger.info(f"LLM ответ: {content}")
-        
-        # Пробуем парсить как многошаговые команды
-        result = parse_multiple_commands(content)
-        
-        # Если есть несколько команд - вернём как список
-        if result.get('commands') and len(result['commands']) > 1:
-            logger.info(f"✅ Найдено {len(result['commands'])} команд")
-            return result
-        
-        # Если одна команда или не удалось - пробуем парсить как одиночную
-        single_result = parse_response(content)
-        if single_result.get('command'):
-            logger.info(f"✅ Найдена одиночная команда: {single_result['command']}")
-            return single_result
-        
-        # Если ничего не получилось - возвращаем результат из parse_multiple_commands
-        if result['commands']:
-            return result
-            
-        return default_response
-
-    except requests.RequestException as e:
-        logger.error(f"Ошибка запроса к LLM: {e}")
-        return {'command': '', 'explanation': f'Ошибка подключения к AI: {e}'}
-    except Exception as e:
-        logger.error(f"Ошибка генерации: {e}")
-        return {'command': '', 'explanation': f'Ошибка генерации команды: {e}'}
-
-
-def parse_multiple_commands(content: str) -> dict:
-    """
-    Парсит ответ LLM и извлекает все команды если их несколько.
-    Возвращает {'commands': [...], 'explanations': [...]}
-    или {'command': '...', 'explanation': '...'} если одна
-    """
-    if not content or not isinstance(content, str):
-        return {'commands': [], 'explanations': []}
-
-    # Удаляем ANSI-escape коды
-    clean = re.sub(r'\x1B\[[0-?]*[ -/]*[@-~]', '', content).strip()
-    
-    lines = clean.split('\n')
-    commands = []
-    explanations = []
-
-    logger.debug(f"Парсинг {len(lines)} строк для многошаговых команд")
-
-    for i, line in enumerate(lines):
-        l = line.strip()
-        
-        if not l:
-            continue
-
-        # Извлекаем команды - ПОЛНУЮ строку после "Команда:"
-        if l.lower().startswith(('команда:', 'command:')):
-            # ✅ ИСПРАВЛЕНИЕ: берем ВСЮ строку после "Команда:" с аргументами
-            candidate = l.split(':', 1)[1].strip('` \t')
-            logger.debug(f"  [{i}] Извлечена полная строка: '{candidate}'")
-            
-            if is_valid_command(candidate):
-                commands.append(candidate)
-                logger.debug(f"  [{i}] ✅ Добавлена команда: {candidate}")
-            else:
-                logger.debug(f"  [{i}] ❌ Невалидная команда: {candidate}")
-
-        # Извлекаем объяснения
-        elif l.lower().startswith(('объяснение:', 'explanation:')):
-            expl = l.split(':', 1)[1].strip()
-            if expl:
-                explanations.append(expl)
-                logger.debug(f"  [{i}] Объяснение: {expl}")
-
-    logger.info(f"✅ Парсинг завершён: найдено {len(commands)} команд")
-
-    if commands:
-        if len(commands) > 1:
-            # Несколько команд - возвращаем как список
-            logger.info(f"📋 Многошаговые команды: {commands}")
-            return {
-                'commands': commands,
-                'explanations': explanations if explanations else [''] * len(commands)
-            }
-        else:
-            # Одна команда - вернём в стандартном формате
-            logger.info(f"🔧 Одиночная команда: {commands[0]}")
-            return {
-                'command': commands[0],
-                'explanation': explanations[0] if explanations else ''
-            }
-
-    logger.warning(f"⚠️ Команды не найдены в ответе")
-    return {'commands': [], 'explanations': []}
-
-
-def parse_response(content: str) -> dict:
-    """
-    Парсит ответ LLM для одиночной команды.
-    Всегда возвращает словарь с ожидаемыми ключами.
-    """
-    default_response = {'command': '', 'explanation': 'Не удалось обработать ответ AI'}
-
-    if not content or not isinstance(content, str):
-        logger.error(f"Пустой или некорректный ответ от LLM: {content}")
-        return default_response
-
-    try:
-        # Удаляем ANSI-escape коды
-        clean = re.sub(r'\x1B\[[0-?]*[ -/]*[@-~]', '', content).strip()
-
-        cmd = ''
-        expl = ''
-
-        logger.debug(f"Парсинг одиночной команды из: {clean[:100]}...")
-
-        # 1. Извлекаем объяснение
-        expl_match = re.search(
-            r'(?:Объяснение:|Explanation:)\s*(.+?)(?:\n\n|\n(?:Команда:|Command:)|$)',
-            clean, re.IGNORECASE | re.DOTALL
+        response = requests.get(
+            f"{OLLAMA_URL}/api/tags",
+            timeout=5
         )
-        if expl_match:
-            expl = expl_match.group(1).strip()[:200]
-            logger.debug(f"  Объяснение: {expl[:50]}...")
-
-        # 2. Пробуем извлечь команду разными способами
-
-        # Способ 1: Стандартный формат "Команда: " - ✅ ИСПРАВЛЕНО
-        # Берем ВСЮ строку до конца (включая аргументы)
-        cmd_match = re.search(r'(?:Команда:|Command:)\s*(.+?)(?:\n|$)', clean, re.IGNORECASE)
-        if cmd_match:
-            candidate = cmd_match.group(1).strip()
-            # Убираем только backticks если есть, но СОХРАНЯЕМ аргументы
-            candidate = re.sub(r'^`|`$', '', candidate).strip()
-            logger.debug(f"  [1] Попытка 1: '{candidate}'")
-            
-            if is_valid_command(candidate):
-                cmd = candidate
-                logger.debug(f"  ✅ Способ 1: {cmd}")
-            else:
-                logger.debug(f"  ❌ Способ 1 не подходит: {candidate}")
-
-        # Способ 2: Markdown блок ```bash\n\n```
-        if not cmd:
-            bash_match = re.search(r'```(?:bash|sh)\s*\n(.+?)\n```', clean, re.DOTALL | re.IGNORECASE)
-            if bash_match:
-                candidate = bash_match.group(1).strip()
-                # Берем только первую строку если многострочный блок
-                candidate = candidate.split('\n')[0].strip()
-                logger.debug(f"  [2] Попытка 2: '{candidate}'")
-                
-                if is_valid_command(candidate):
-                    cmd = candidate
-                    logger.debug(f"  ✅ Способ 2: {cmd}")
-
-        # Способ 3: Просто в backticks
-        if not cmd:
-            tick_match = re.search(r'`([^`]+)`', clean)
-            if tick_match:
-                candidate = tick_match.group(1).strip()
-                logger.debug(f"  [3] Попытка 3: '{candidate}'")
-                
-                if is_valid_command(candidate):
-                    cmd = candidate
-                    logger.debug(f"  ✅ Способ 3: {cmd}")
-
-        # Способ 4: Первая валидная строка
-        if not cmd:
-            lines = clean.split('\n')
-            for line_num, line in enumerate(lines):
-                line = line.strip()
-                if not line or line.startswith(('Команда:', 'Command:', 'Объяснение:',
-                                               'Explanation:', '#', '//', '---')):
-                    continue
-                logger.debug(f"  [4] Попытка 4 (строка {line_num}): '{line}'")
-                
-                if is_valid_command(line):
-                    cmd = line
-                    logger.debug(f"  ✅ Способ 4: {cmd}")
-                    break
-
-        # Если команда не найдена
-        if not cmd:
-            logger.warning(f"❌ Не удалось извлечь команду из: {clean[:200]}...")
-            return {'command': '', 'explanation': 'Не удалось извлечь валидную команду из ответа'}
-
-        logger.info(f"✅ Финальная команда: '{cmd}'")
-        return {'command': cmd, 'explanation': expl}
-
+        if response.status_code == 200:
+            logger.info("Ollama доступна")
+            return True
+        else:
+            logger.error(f"Ollama вернула статус {response.status_code}")
+            return False
     except Exception as e:
-        logger.error(f"❌ Ошибка парсинга ответа LLM: {e}")
-        return default_response
-
-
-def is_valid_command(command: str) -> bool:
-    """
-    Проверяет, что команда начинается с известной утилиты или пути.
-    ВАЖНО: Проверяет ПЕРВОЕ СЛОВО (до пробела), но не отбрасывает аргументы!
-    """
-    if not command or len(command) < 2:
-        logger.debug(f"    is_valid_command: ❌ слишком короткая: '{command}'")
+        logger.error(f"Ошибка подключения: {e}")
         return False
 
+
+def list_available_models() -> List[str]:
+    """Получает список доступных моделей в ollama"""
     try:
-        # ✅ ИСПРАВЛЕНИЕ: используем shlex для правильного парсинга
-        # но проверяем только первую часть
-        parts = shlex.split(command)
+        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
+        response.raise_for_status()
+        models = []
+        for model in response.json().get("models", []):
+            models.append(model.get("name", "unknown"))
+        logger.info(f"Найдено {len(models)} моделей в ollama")
+        return models
     except Exception as e:
-        logger.debug(f"    is_valid_command: ❌ ошибка shlex: {e}")
-        return False
+        logger.error(f"Ошибка при получении списка моделей: {e}")
+        return []
 
-    if not parts:
-        logger.debug(f"    is_valid_command: ❌ пусто после парсинга: '{command}'")
-        return False
 
-    tool = parts[0]
-
-    # Относительный или абсолютный путь
-    if tool.startswith('/') or tool.startswith('./') or tool.startswith('../'):
-        logger.debug(f"    is_valid_command: ✅ путь: {tool}")
-        return True
-
-    # Чистое имя утилиты
-    if tool in COMMON_COMMANDS:
-        logger.debug(f"    is_valid_command: ✅ утилита: {tool}")
-        return True
-
-    logger.debug(f"    is_valid_command: ❌ неизвестная утилита: {tool}")
-    return False
+def get_command_from_prompt(prompt: str) -> Dict:
+    """Альтернативное имя для generate_command"""
+    return generate_command(prompt)
