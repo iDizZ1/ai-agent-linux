@@ -61,7 +61,7 @@ git clone https://github.com/iDizZ1/ai-agent-linux.git
 
 ```bash
 cd ai-agent-linux
-setup_ai.sh
+./setup_ai.sh
 ```
 
 После устанвки сразу откроется интерактивный режим, можно пользоваться!
